@@ -4,6 +4,7 @@ from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
 
 from RtpPacket import RtpPacket
+import queue
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -38,6 +39,9 @@ class Client:
 		self.bytes_recv = 0
 		self.play_start_ts = None
   		#---
+		self.frame_buffer =queue.Queue()
+		self.BUFFER_THREHOLD = 200
+		self.is_buffering = True
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -96,7 +100,35 @@ class Client:
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
 			self.sendRtspRequest(self.PLAY)
-	
+
+		self.is_buffering = True
+		with self.frame_buffer.mutex:
+			self.frame_buffer.queue.clear()
+   
+		self.play_buffered_video()
+  
+	def play_buffered_video(self):
+		if self.state != self.PLAYING and self.state != self.READY:
+			if self.teardownAcked: return
+		
+		if self.is_buffering:
+			if self.frame_buffer.qsize() >= self.BUFFER_THREHOLD:
+				print(f"[Buffering] Complete! Buffer size: {self.frame_buffer.qsize()}")
+				self.is_buffering = False
+			else:
+				pass
+
+		if not self.is_buffering and not self.frame_buffer.empty():
+			try:
+				frame_data = self.frame_buffer.get_nowait()
+				image_path = self.writeFrame(frame_data)
+				self.updateMovie(image_path)
+			except queue.Empty:
+				pass
+    
+		if not self.teardownAcked:
+			self.master.after(40, self.play_buffered_video)
+
 	def listenRtp(self):		
 		"""Listen for RTP packets."""
 		while True:
@@ -107,7 +139,7 @@ class Client:
 					rtpPacket.decode(data)
 					
 					currFrameNbr = rtpPacket.seqNum()
-					print("Current Seq Num: " + str(currFrameNbr))
+					#print("Current Seq Num: " + str(currFrameNbr))
      
 					#---
 					payload = rtpPacket.getPayload()
@@ -116,7 +148,8 @@ class Client:
 										
 					if currFrameNbr > self.frameNbr: # Discard the late packet
 						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+						#self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+						self.frame_buffer.put(payload)
 			except:
 					# Stop listening upon requesting PAUSE or TEARDOWN
 					if hasattr(self, 'playEvent') and self.playEvent.isSet(): 
@@ -143,10 +176,13 @@ class Client:
 	
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
-		self.label.image = photo
-		
+		try:
+			photo = ImageTk.PhotoImage(Image.open(imageFile))
+			self.label.configure(image = photo, height=288) 
+			self.label.image = photo
+		except Exception as e:
+			print(f"Error updating movie rame: {e}")
+
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
 		self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -190,20 +226,22 @@ class Client:
 	def recvRtspReply(self):
 		"""Receive RTSP reply from the server."""
 		while True:
-			reply = self.rtspSocket.recv(1024)
-			
-			if reply: 
-				self.parseRtspReply(reply.decode("utf-8"))
-			
-			# Close the RTSP socket upon requesting Teardown
-			if self.requestSent == self.TEARDOWN:
-				try:
-					self.rtspSocket.shutdown(socket.SHUT_RDWR)
-					self.rtspSocket.close()
-				except Exception:
-					pass
+			try:
+				reply = self.rtspSocket.recv(1024)
+				
+				if reply: 
+					self.parseRtspReply(reply.decode("utf-8"))
+				
+				# Close the RTSP socket upon requesting Teardown
+				if self.requestSent == self.TEARDOWN:
+					try:
+						self.rtspSocket.shutdown(socket.SHUT_RDWR)
+						self.rtspSocket.close()
+					except Exception:
+						pass
+					break
+			except Exception:
 				break
-	
 	def parseRtspReply(self, data):
 		"""Parse the RTSP reply from the server."""
 		lines = data.split('\n')
