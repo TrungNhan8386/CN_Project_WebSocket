@@ -28,13 +28,22 @@ class ServerWorker:
 		threading.Thread(target=self.recvRtspRequest).start()
 	
 	def recvRtspRequest(self):
-		"""Receive RTSP request from the client."""
-		connSocket = self.clientInfo['rtspSocket'][0]
-		while True:            
-			data = connSocket.recv(256)
-			if data:
-				print("Data received:\n" + data.decode("utf-8"))
-				self.processRtspRequest(data.decode("utf-8"))
+			"""Receive RTSP request from the client."""
+			connSocket = self.clientInfo['rtspSocket'][0]
+			while True:            
+				try:
+					data = connSocket.recv(256)
+					if data:
+						print("Data received:\n" + data.decode("utf-8"))
+						self.processRtspRequest(data.decode("utf-8"))
+					else:
+						# Client đóng kết nối (gửi FIN packet)
+						break
+				except Exception:
+					# Client đóng kết nối đột ngột (TEARDOWN hoặc tắt app)
+					# Đây là nơi bắt lỗi WinError 10054
+					print("Client finished connection.")
+					break
 	
 	def processRtspRequest(self, data):
 		"""Process RTSP request sent from the client."""
@@ -108,43 +117,69 @@ class ServerWorker:
 			self.clientInfo['rtpSocket'].close()
 			
 	def sendRtp(self):
-		"""Send RTP packets over UDP."""
-		while True:
-			self.clientInfo['event'].wait(0.05) 
-			
-			# Stop sending if request is PAUSE or TEARDOWN
-			if self.clientInfo['event'].isSet(): 
-				break 
+			"""Send RTP packets over UDP."""
+			while True:
+				self.clientInfo['event'].wait(0.05) 
 				
-			data = self.clientInfo['videoStream'].nextFrame()
-			if data: 
-				frameNumber = self.clientInfo['videoStream'].frameNbr()
-				try:
-					address = self.clientInfo['rtspSocket'][1][0]
-					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
-				except:
-					print("Connection Error")
-					#print('-'*60)
-					#traceback.print_exc(file=sys.stdout)
-					#print('-'*60)
+				if self.clientInfo['event'].isSet(): 
+					break 
+					
+				data = self.clientInfo['videoStream'].nextFrame()
+				
+				if data: 
+					frameNumber = self.clientInfo['videoStream'].frameNbr()
+					try:
+						address = self.clientInfo['rtspSocket'][1][0]
+						port = int(self.clientInfo['rtpPort'])
+						
+						# --- XỬ LÝ PHÂN MẢNH (FRAGMENTATION) ---
+						# Nếu frame > 1400 bytes (MTU an toàn), cắt nhỏ ra
+						MAX_PAYLOAD_SIZE = 1400
+						data_len = len(data)
+						
+						if data_len > MAX_PAYLOAD_SIZE:
+							# Cần chia nhỏ
+							start = 0
+							while start < data_len:
+								end = start + MAX_PAYLOAD_SIZE
+								if end >= data_len:
+									end = data_len
+									marker = 1 # Mảnh cuối cùng của frame -> Marker = 1
+								else:
+									marker = 0 # Chưa hết frame -> Marker = 0
+								
+								payload = data[start:end]
+								self.clientInfo['rtpSocket'].sendto(
+									self.makeRtp(payload, frameNumber, marker), 
+									(address, port)
+								)
+								start = end
+						else:
+							# Frame nhỏ, gửi 1 gói như cũ, Marker luôn là 1
+							self.clientInfo['rtpSocket'].sendto(
+								self.makeRtp(data, frameNumber, 1), 
+								(address, port)
+							)
+							
+					except Exception as e:
+						print("Connection Error or Send Error")
+						# traceback.print_exc()
 
-	def makeRtp(self, payload, frameNbr):
-		"""RTP-packetize the video data."""
-		version = 2
-		padding = 0
-		extension = 0
-		cc = 0
-		marker = 0
-		pt = 26 # MJPEG type
-		seqnum = frameNbr
-		ssrc = 0 
-		
-		rtpPacket = RtpPacket()
-		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
-		
-		return rtpPacket.getPacket()
+	def makeRtp(self, payload, frameNbr, marker_bit=0):
+			"""RTP-packetize the video data."""
+			version = 2
+			padding = 0
+			extension = 0
+			cc = 0
+			marker = marker_bit # Dùng tham số truyền vào
+			pt = 26 
+			seqnum = frameNbr
+			ssrc = 0 
+			
+			rtpPacket = RtpPacket()
+			rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
+			
+			return rtpPacket.getPacket()
 		
 	def replyRtsp(self, code, seq):
 		"""Send RTSP reply to the client."""

@@ -42,6 +42,15 @@ class Client:
         self.connectToServer()
         self.frameNbr = 0
         #---
+        # --- THỐNG KÊ DATA ANALYSIS ---
+        self.total_packets_received = 0
+        self.total_packets_lost = 0
+        self.total_bytes_received = 0
+        self.start_time = 0
+        self.packet_loss_rate = 0.0
+        self.data_rate = 0.0 # kbps
+        self.temp_frame_buffer = b'' # Buffer tạm để gom mảnh
+        #---
         self.bytes_recv = 0
         self.play_start_ts = None
         #---
@@ -215,52 +224,86 @@ class Client:
         self.master.after(40, self.play_buffered_video)
 
     def listenRtp(self):        
-        """Listen for RTP packets."""
-        while True:
-            # 1. KIỂM TRA CỜ DỪNG (FLAG) TRƯỚC TIÊN
-            if hasattr(self, 'playEvent') and self.playEvent.isSet():
-                break
-
-            try:
-                # 2. CHỜ NHẬN DỮ LIỆU (BLOCKING TẠI ĐÂY)
-                data = self.rtpSocket.recv(20480) 
-
-                # 3. KIỂM TRA LẠI CỜ NGAY SAU KHI NHẬN (QUAN TRỌNG)
-                if hasattr(self, 'playEvent') and self.playEvent.isSet():
-                    continue # Vứt bỏ data và thoát
-
-                if data:
-                    rtpPacket = RtpPacket()
-                    rtpPacket.decode(data)
-                    
-                    currFrameNbr = rtpPacket.seqNum()
-                    payload = rtpPacket.getPayload()
-                    self.bytes_recv += len(payload)
-
-                    # Minimal debug: print only RTP sequence number
-                    try:
-                        print(f"Seq Number: {currFrameNbr}")
-                    except Exception:
-                        pass
-                                    
-                    if currFrameNbr > self.frameNbr: 
-                        self.frameNbr = currFrameNbr
-                        # 4. CHỈ THÊM VÀO BUFFER NẾU KHÔNG CÓ LỆNH DỪNG
-                        if not (hasattr(self, 'playEvent') and self.playEvent.isSet()):
-                            self.frame_buffer.put(payload)
+            """Listen for RTP packets."""
+            import time
+            self.start_time = time.time()
             
-            except socket.timeout:
-                continue # Timeout là bình thường, lặp lại
-            except Exception as e:
-                break # Lỗi (ví dụ socket bị đóng), thoát vòng lặp
+            expected_seq_num = 0 # Dùng để tính packet loss
+
+            while True:
+                # 1. Check stop flag
+                if hasattr(self, 'playEvent') and self.playEvent.isSet():
+                    break
+
+                try:
+                    # 2. Receive data
+                    data = self.rtpSocket.recv(20480) 
+
+                    if hasattr(self, 'playEvent') and self.playEvent.isSet():
+                        continue
+
+                    if data:
+                        rtpPacket = RtpPacket()
+                        rtpPacket.decode(data)
+                        
+                        # --- THỐNG KÊ (ANALYSIS) ---
+                        currSeqNum = rtpPacket.seqNum()
+                        self.total_packets_received += 1
+                        self.total_bytes_received += len(rtpPacket.getPayload())
+                        
+                        # Tính Packet Loss cơ bản
+                        if currSeqNum > expected_seq_num + 1:
+                            # Nếu nhảy cóc số thứ tự -> mất gói
+                            loss = currSeqNum - (expected_seq_num + 1)
+                            self.total_packets_lost += loss
+                            # print(f"Lost {loss} packets!")
+                        
+                        expected_seq_num = currSeqNum
+
+                        # Cập nhật tỉ lệ (có thể in ra console hoặc hiện lên GUI)
+                        elapsed = time.time() - self.start_time
+                        if elapsed > 0:
+                            self.data_rate = (self.total_bytes_received * 8) / (elapsed * 1000) # kbps
+                        if (self.total_packets_received + self.total_packets_lost) > 0:
+                            self.packet_loss_rate = (self.total_packets_lost / (self.total_packets_received + self.total_packets_lost)) * 100
+                        
+                        # In thống kê mỗi 100 gói nhận được (để đỡ spam log)
+                        if self.total_packets_received % 100 == 0:
+                            print(f"[Stats] Rate: {self.data_rate:.2f} kbps | Loss: {self.packet_loss_rate:.2f}%")
+
+                        # --- REASSEMBLY (GOM MẢNH) ---
+                        marker = rtpPacket.getMarker()
+                        payload = rtpPacket.getPayload()
+                        
+                        # Gom payload vào buffer tạm
+                        self.temp_frame_buffer += payload
+                        
+                        # Nếu Marker = 1 -> Đã nhận đủ một Frame hoàn chỉnh
+                        if marker == 1:
+                            # Chỉ xử lý khi đủ frame
+                            # Logic cũ: so sánh seqNum để tránh duplicate frame
+                            if currSeqNum > self.frameNbr: 
+                                self.frameNbr = currSeqNum
+                                if not (hasattr(self, 'playEvent') and self.playEvent.isSet()):
+                                    # Đẩy toàn bộ frame đã ghép vào buffer hiển thị
+                                    self.frame_buffer.put(self.temp_frame_buffer)
+                            
+                            # Reset buffer tạm
+                            self.temp_frame_buffer = b''
+                
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    # print(f"RTP Exception: {e}")
+                    break
         
-        # Dọn dẹp socket khi TEARDOWN
-        if self.teardownAcked == 1:
-            try:
-                self.rtpSocket.shutdown(socket.SHUT_RDWR)
-                self.rtpSocket.close()
-            except Exception:
-                pass
+            # Dọn dẹp socket khi TEARDOWN
+            if self.teardownAcked == 1:
+                try:
+                    self.rtpSocket.shutdown(socket.SHUT_RDWR)
+                    self.rtpSocket.close()
+                except Exception:
+                    pass
             
     def writeFrame(self, data):
         """Write the received frame to a temp image file. Return the image file."""
@@ -275,15 +318,24 @@ class Client:
         return cachename
     
     def updateMovie(self, imageFile):
-        """Update the image file as video frame in the GUI."""
-        if not imageFile: 
-            return
-        try:
-            photo = ImageTk.PhotoImage(Image.open(imageFile))
-            self.label.configure(image = photo, height=288) 
-            self.label.image = photo
-        except Exception as e:
-            pass # Bỏ qua lỗi (ví dụ file đang bị ghi đè)
+            """Update the image file as video frame in the GUI."""
+            if not imageFile: 
+                return
+            try:
+                photo = ImageTk.PhotoImage(Image.open(imageFile))
+                
+                # --- CODE THÔNG MINH ---
+                # Nếu ảnh nhỏ (như movie.Mjpeg), giữ height=288 cho giống hệt code gốc
+                if photo.height() <= 288:
+                    self.label.configure(image = photo, height=288)
+                # Nếu ảnh lớn (HD), thì bỏ ép buộc chiều cao để nó tự bung ra
+                else:
+                    self.label.configure(image = photo, height=photo.height())
+                # -----------------------
+                
+                self.label.image = photo
+            except Exception as e:
+                pass
 
     def connectToServer(self):
         """Connect to the Server. Start a new RTSP/TCP session."""
